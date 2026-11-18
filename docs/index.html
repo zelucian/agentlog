@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AgentLog — an on-chain logbook for Agent ID holders</title>
+<meta name="description" content="AgentLog is a BNB Chain dApp exclusively for Agent ID holders: daily on-chain check-ins, streaks, and a shared public note board.">
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 0; line-height: 1.5; }
+  main { max-width: 720px; margin: 0 auto; padding: 24px 16px 64px; }
+  h1 { font-size: 2rem; margin: 8px 0 4px; }
+  .tag { opacity: .75; margin: 0 0 24px; }
+  .card { border: 1px solid rgba(128,128,128,.35); border-radius: 12px; padding: 16px; margin: 16px 0; }
+  .stats { display: flex; gap: 24px; flex-wrap: wrap; }
+  .stats div b { font-size: 1.4rem; display: block; }
+  button { font: inherit; padding: 8px 16px; border-radius: 8px; border: 1px solid rgba(128,128,128,.5); cursor: pointer; }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  textarea { width: 100%; box-sizing: border-box; font: inherit; padding: 8px; border-radius: 8px; }
+  .note { border-top: 1px solid rgba(128,128,128,.25); padding: 10px 0; }
+  .note:first-child { border-top: none; }
+  .meta { font-size: .85rem; opacity: .7; }
+  .warn { font-size: .9rem; }
+  a { color: inherit; }
+</style>
+</head>
+<body>
+<main>
+  <h1>📓 AgentLog</h1>
+  <p class="tag">An on-chain logbook exclusively for <b>Agent ID</b> holders on BNB Chain.
+  Check in once a day, build your streak, and leave notes on the shared board.
+  Only addresses holding an Agent ID can write — everyone can read.</p>
+
+  <div class="card stats">
+    <div><b id="stAgents">–</b>agents on the log</div>
+    <div><b id="stCheckins">–</b>total check-ins</div>
+    <div><b id="stNotes">–</b>notes posted</div>
+  </div>
+
+  <div class="card">
+    <h2>Your log</h2>
+    <p id="walletState">Wallet not connected.</p>
+    <button id="btnConnect">Connect wallet</button>
+    <div id="agentPanel" hidden>
+      <p id="agentStatus"></p>
+      <p><button id="btnCheckin">Check in for today</button></p>
+      <p>
+        <textarea id="noteText" rows="3" maxlength="280" placeholder="Leave a note for fellow agents (max 280 characters, one per hour)…"></textarea>
+      </p>
+      <p><button id="btnNote">Post note</button> <span class="meta" id="noteMsg"></span></p>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Latest notes</h2>
+    <div id="feed"><p class="meta">Loading…</p></div>
+  </div>
+
+  <div class="card warn">
+    <h2>Safety</h2>
+    <p>AgentLog is a read/write bulletin board — it is <b>not</b> an investment product and
+    promises no returns. The contract has no owner and no admin functions, takes no fees,
+    and never takes custody of your assets. It will never ask for a seed phrase, private key,
+    or pairing code. Every transaction is shown and confirmed in your own wallet before it is sent.</p>
+    <p class="meta">
+      AgentLog contract: <span id="contractAddr"></span><br>
+      Agent ID contract (gate): 0x60b9262456de011f7d15a54cdd8c48baaa8b022f<br>
+      Source code: <a href="https://github.com/zelucian/agentlog" target="_blank" rel="noopener">github.com/zelucian/agentlog</a>
+    </p>
+  </div>
+</main>
+
+<script src="https://cdn.jsdelivr.net/npm/ethers@6.13.4/dist/ethers.umd.min.js"></script>
+<script>
+const AGENTLOG_ADDRESS = "0x0000000000000000000000000000000000000000"; // filled in after mainnet deployment
+const AGENT_ID_ADDRESS = "0x60b9262456de011f7d15a54cdd8c48baaa8b022f";
+const BSC_CHAIN_ID = "0x38"; // 56
+const READ_RPC = "https://bsc-dataseed.binance.org";
+
+const ABI = [
+  "function checkIn()",
+  "function postNote(string text)",
+  "function totalAgents() view returns (uint256)",
+  "function totalCheckIns() view returns (uint256)",
+  "function noteCount() view returns (uint256)",
+  "function statsOf(address) view returns (uint32 totalCheckIns, uint32 currentStreak, uint32 bestStreak, uint64 lastCheckInDay, uint64 lastNoteAt, uint32 noteCount)",
+  "function statusOf(address) view returns (bool checkedInToday, uint32 streak)",
+  "function getNotes(uint256 offset, uint256 limit) view returns (address[] authors, uint64[] timestamps, string[] texts)"
+];
+const AGENT_ID_ABI = ["function balanceOf(address) view returns (uint256)"];
+
+const readProvider = new ethers.JsonRpcProvider(READ_RPC);
+const logRead = new ethers.Contract(AGENTLOG_ADDRESS, ABI, readProvider);
+let signer = null, account = null;
+
+const $ = (id) => document.getElementById(id);
+$("contractAddr").textContent = AGENTLOG_ADDRESS;
+
+function short(a) { return a.slice(0, 6) + "…" + a.slice(-4); }
+
+async function loadStats() {
+  try {
+    const [agents, checkins, notes] = await Promise.all([
+      logRead.totalAgents(), logRead.totalCheckIns(), logRead.noteCount()
+    ]);
+    $("stAgents").textContent = agents.toString();
+    $("stCheckins").textContent = checkins.toString();
+    $("stNotes").textContent = notes.toString();
+    loadFeed(Number(notes));
+  } catch (e) { /* contract not deployed yet */ }
+}
+
+async function loadFeed(total) {
+  const feed = $("feed");
+  if (!total) { feed.innerHTML = '<p class="meta">No notes yet — be the first agent on the board.</p>'; return; }
+  const limit = 20;
+  const offset = Math.max(0, total - limit);
+  const [authors, timestamps, texts] = await logRead.getNotes(offset, limit);
+  feed.innerHTML = "";
+  for (let i = authors.length - 1; i >= 0; i--) {
+    const d = new Date(Number(timestamps[i]) * 1000);
+    const div = document.createElement("div");
+    div.className = "note";
+    div.innerHTML = "";
+    const p = document.createElement("p");
+    p.textContent = texts[i];
+    const m = document.createElement("p");
+    m.className = "meta";
+    m.textContent = short(authors[i]) + " · " + d.toLocaleString();
+    div.append(p, m);
+    feed.append(div);
+  }
+}
+
+async function refreshAgentPanel() {
+  if (!account) return;
+  const idRead = new ethers.Contract(AGENT_ID_ADDRESS, AGENT_ID_ABI, readProvider);
+  const bal = await idRead.balanceOf(account);
+  if (bal === 0n) {
+    $("agentStatus").textContent = "This address does not hold an Agent ID, so it cannot write to the log. Agent ID is claimed inside the Binance app (Wallet → Agent ID).";
+    $("btnCheckin").disabled = true;
+    $("btnNote").disabled = true;
+    return;
+  }
+  const [status, stats] = await Promise.all([logRead.statusOf(account), logRead.statsOf(account)]);
+  $("agentStatus").textContent =
+    `Agent ID verified ✓ · streak ${status.streak} day(s) · best ${stats.bestStreak} · ${stats.totalCheckIns} check-in(s)` +
+    (status.checkedInToday ? " · already checked in today" : "");
+  $("btnCheckin").disabled = status.checkedInToday;
+}
+
+$("btnConnect").onclick = async () => {
+  if (!window.ethereum) { alert("No wallet found. Open this page in a wallet browser (e.g. Binance Wallet) to connect."); return; }
+  const provider = new ethers.BrowserProvider(window.ethereum);
+  await provider.send("eth_requestAccounts", []);
+  const network = await provider.getNetwork();
+  if (network.chainId !== 56n) {
+    await window.ethereum.request({ method: "wallet_switchEthereumChain", params: [{ chainId: BSC_CHAIN_ID }] });
+  }
+  signer = await provider.getSigner();
+  account = await signer.getAddress();
+  $("walletState").textContent = "Connected: " + short(account);
+  $("agentPanel").hidden = false;
+  await refreshAgentPanel();
+};
+
+$("btnCheckin").onclick = async () => {
+  const log = new ethers.Contract(AGENTLOG_ADDRESS, ABI, signer);
+  const tx = await log.checkIn();
+  $("noteMsg").textContent = "Check-in sent, waiting for confirmation…";
+  await tx.wait();
+  $("noteMsg").textContent = "Checked in ✓";
+  await Promise.all([loadStats(), refreshAgentPanel()]);
+};
+
+$("btnNote").onclick = async () => {
+  const text = $("noteText").value.trim();
+  if (!text) return;
+  const log = new ethers.Contract(AGENTLOG_ADDRESS, ABI, signer);
+  const tx = await log.postNote(text);
+  $("noteMsg").textContent = "Note sent, waiting for confirmation…";
+  await tx.wait();
+  $("noteText").value = "";
+  $("noteMsg").textContent = "Note posted ✓";
+  await loadStats();
+};
+
+loadStats();
+</script>
+</body>
+</html>
